@@ -1,0 +1,22 @@
+[project]
+name = "pr-radar"
+version = "0.1.0"
+description = "Terminal dashboard for your pending GitHub pull requests"
+readme = "README.md"
+authors = [
+    { name = "Andrey Yantsen", email = "andrey.yantsen@nscale.com" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+pr-radar = "pr_radar:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
