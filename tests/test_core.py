@@ -1,5 +1,6 @@
 """Tests for pr-radar domain logic: durations, classification, and rendering."""
 
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -8,10 +9,14 @@ from helpers import make_pr
 
 from pr_radar import (
     DRAFT_DIVIDER_TEXT,
+    _search_status,
+    build_json,
     build_output,
     classify,
     humanize,
+    normalize_pr,
     reviewer_cell,
+    reviewer_states,
     waiting_since,
 )
 
@@ -194,6 +199,137 @@ def test_classify_sort_tie_break_by_url():
     assert mine == [pr_a, pr_z]
 
 
+# --- reviewer states / normalization ---------------------------------------
+
+
+def test_reviewer_states_verdicts_become_words():
+    pr = make_pr(
+        reviews=[
+            ("alice", "APPROVED", "2026-08-01T00:00:00Z"),
+            ("bob", "CHANGES_REQUESTED", "2026-08-01T00:00:00Z"),
+            ("carol", "COMMENTED", "2026-08-01T00:00:00Z"),
+        ]
+    )
+
+    states = reviewer_states(pr)
+
+    assert states == [
+        {"login": "alice", "state": "approved", "code_owner": False, "team": False},
+        {"login": "bob", "state": "changes_requested", "code_owner": False, "team": False},
+        {"login": "carol", "state": "commented", "code_owner": False, "team": False},
+    ]
+
+
+def test_reviewer_states_pending_overrides_verdict():
+    pr = make_pr(
+        reviews=[("grace", "APPROVED", "2026-08-01T00:00:00Z")],
+        requests=[("grace", False)],
+    )
+
+    assert reviewer_states(pr) == [
+        {"login": "grace", "state": "pending", "code_owner": False, "team": False}
+    ]
+
+
+def test_reviewer_states_code_owner_and_team():
+    pr = make_pr(requests=[("erin", True), ("#platform", True)])
+
+    assert reviewer_states(pr) == [
+        {"login": "erin", "state": "pending", "code_owner": True, "team": False},
+        {"login": "platform", "state": "pending", "code_owner": True, "team": True},
+    ]
+
+
+def test_reviewer_states_users_before_teams_alphabetical():
+    pr = make_pr(
+        reviews=[("bob", "APPROVED", "2026-08-01T00:00:00Z")],
+        requests=[("alice", False), ("#zeta", False), ("#alpha", False)],
+    )
+
+    logins = [(entry["login"], entry["team"]) for entry in reviewer_states(pr)]
+
+    assert logins == [
+        ("alice", False),
+        ("bob", False),
+        ("alpha", True),
+        ("zeta", True),
+    ]
+
+
+def test_reviewer_states_skips_dismissed_and_null_shapes():
+    pr = make_pr(
+        reviews=[("frank", "DISMISSED", "2026-08-01T00:00:00Z")],
+        extra={
+            "reviewRequests": {
+                "nodes": [{"asCodeOwner": False, "requestedReviewer": None}]
+            }
+        },
+    )
+
+    assert reviewer_states(pr) == []
+
+
+def test_normalize_pr_full_record():
+    pr = make_pr(
+        number=7,
+        repo="acme/widgets",
+        title="feat(api): a title well over fifty characters long xxxxxxxxxxxx",
+        author=("alice", "Alice A"),
+        created="2026-08-01T00:00:00Z",
+        ready_at="2026-08-03T00:00:00Z",
+        decision="CHANGES_REQUESTED",
+        base_ref="main",
+        head_ref="feature/x",
+        additions=120,
+        deletions=45,
+        changed_files=6,
+        last_commit="2026-08-04T00:00:00Z",
+        ci_state="SUCCESS",
+        requests=[("bob", True)],
+    )
+
+    record = normalize_pr(pr)
+
+    assert record == {
+        "repo": "acme/widgets",
+        "number": 7,
+        "url": "https://github.com/acme/widgets/pull/7",
+        "title": "feat(api): a title well over fifty characters long xxxxxxxxxxxx",
+        "author": {"login": "alice", "name": "Alice A"},
+        "draft": False,
+        "created_at": "2026-08-01T00:00:00Z",
+        "waiting_since": "2026-08-03T00:00:00Z",
+        "decision": "changes_requested",
+        "reviewers": [
+            {"login": "bob", "state": "pending", "code_owner": True, "team": False}
+        ],
+        "ci": "SUCCESS",
+        "base": "main",
+        "head": "feature/x",
+        "additions": 120,
+        "deletions": 45,
+        "changed_files": 6,
+    }
+
+
+def test_normalize_pr_nulls():
+    pr = make_pr(draft=True, author=None, decision=None, last_commit=None)
+
+    record = normalize_pr(pr)
+
+    assert record["draft"] is True
+    assert record["waiting_since"] is None
+    assert record["author"] is None
+    assert record["decision"] is None
+    assert record["ci"] is None
+
+
+def test_normalize_pr_null_rollup_is_null_ci():
+    pr = make_pr(last_commit="2026-08-01T00:00:00Z", ci_state=None)
+
+    assert normalize_pr(pr)["ci"] is None
+
+
 # --- reviewer marks / cell -----------------------------------------------
 
 REVIEWER_CELL_CASES = [
@@ -298,15 +434,15 @@ REVIEWER_CELL_CASES = [
     ids=[c[0] for c in REVIEWER_CELL_CASES],
 )
 def test_reviewer_cell(kwargs, expected):
-    pr = make_pr(**kwargs)
-    assert reviewer_cell(pr) == expected
+    record = normalize_pr(make_pr(**kwargs))
+    assert reviewer_cell(record) == expected
 
 
 def test_reviewer_cell_caps_at_six_plus_tail():
     requests = [(f"user{i}", False) for i in range(7)]
-    pr = make_pr(requests=requests)
+    record = normalize_pr(make_pr(requests=requests))
 
-    cell = reviewer_cell(pr)
+    cell = reviewer_cell(record)
 
     parts = cell.split(" ")
     assert parts[:6] == [f"user{i}·" for i in range(6)]
@@ -366,6 +502,76 @@ def test_links_false_emits_no_escape_bytes():
     output = build_output([pr], [], now, [], False, {})
 
     assert "\x1b" not in output
+
+
+# --- JSON output -------------------------------------------------------------
+
+
+def test_build_json_full_untruncated_data():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    title = "feat(api): " + "x" * 60
+    requests = [(f"user{i}", False) for i in range(7)]
+    pr = make_pr(
+        number=1,
+        repo="acme/a",
+        title=title,
+        author=("alice", "Alexandrina Considerable-Longname"),
+        created="2026-08-01T00:00:00Z",
+        requests=requests,
+    )
+
+    payload = json.loads(build_json([pr], [], now, {"mine": "ok"}))
+
+    record = payload["mine"][0]
+    assert record["title"] == title
+    assert len(record["reviewers"]) == 7
+    assert record["author"]["name"] == "Alexandrina Considerable-Longname"
+    assert record["age"] == "2w"
+    assert record["waiting"] == "2w"
+    assert payload["generated_at"] == now.isoformat()
+    assert payload["searches"] == {"mine": "ok"}
+    assert payload["review"] == []
+
+
+def test_build_json_preserves_display_order():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    first = make_pr(number=1, repo="acme/a")
+    second = make_pr(number=2, repo="acme/b")
+
+    payload = json.loads(build_json([], [first, second], now, {}))
+
+    assert [pr["number"] for pr in payload["review"]] == [1, 2]
+
+
+def test_build_json_draft_has_null_waiting_and_age_set():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    draft = make_pr(number=1, repo="acme/a", draft=True, created="2026-08-01T00:00:00Z")
+
+    payload = json.loads(build_json([draft], [], now, {}))
+
+    record = payload["mine"][0]
+    assert record["waiting_since"] is None
+    assert record["waiting"] is None
+    assert record["age"] == "2w"
+
+
+def test_search_status_maps_results_and_truncation():
+    results = {"mine": [], "requested": [], "reviewed": None, "team": []}
+
+    status = _search_status(results, {"requested"})
+
+    assert status == {
+        "mine": "ok",
+        "requested": "truncated",
+        "reviewed": "failed",
+        "team": "ok",
+    }
+
+
+def test_search_status_omits_searches_that_did_not_run():
+    status = _search_status({"mine": []}, set())
+
+    assert status == {"mine": "ok"}
 
 
 # --- colour ----------------------------------------------------------------

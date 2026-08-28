@@ -62,6 +62,57 @@ def test_include_drafts_flag_parses_true():
     assert args.include_drafts is True
 
 
+def test_json_flag_defaults_false():
+    args = pr_radar._parse_args([])
+    assert args.json is False
+
+
+def test_json_flag_parses_true():
+    assert pr_radar._parse_args(["-j"]).json is True
+    assert pr_radar._parse_args(["--json"]).json is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--json", "--detailed"], ["--json", "--highlight-reviewers", "alice"]],
+    ids=["detailed", "highlight"],
+)
+def test_json_rejects_rendering_flags(argv):
+    with pytest.raises(SystemExit) as exc_info:
+        pr_radar._parse_args(argv)
+    assert exc_info.value.code == 2
+
+
+def test_end_to_end_json_output(monkeypatch, capsys):
+    import json
+
+    org_quals = ["org:acme"]
+    pr = make_pr(number=1, repo="acme/a", title="Some title")
+    responses = {
+        tuple(pr_radar.ORG_LOOKUP_ARGS): "acme\n",
+        tuple(pr_radar.TEAM_LOOKUP_ARGS): "",
+        tuple(_search_args("mine", org_quals)): search_response([pr]),
+        tuple(_search_args("requested", org_quals)): search_response([]),
+        tuple(_search_args("reviewed", org_quals)): search_response([]),
+    }
+    monkeypatch.setattr(pr_radar, "run_gh", fake_gh(responses))
+
+    exit_code = pr_radar.main(["-j"])
+
+    out, _ = capsys.readouterr()
+    assert exit_code == 0
+    payload = json.loads(out)
+    assert payload["mine"][0]["repo"] == "acme/a"
+    assert payload["mine"][0]["number"] == 1
+    assert payload["searches"] == {
+        "mine": "ok",
+        "requested": "ok",
+        "reviewed": "ok",
+    }
+    assert "\x1b" not in out
+    assert "code owner" not in out
+
+
 def test_short_flags_parse_like_long_forms():
     args = pr_radar._parse_args(["-o", "acme", "-r", "alice", "-d", "-i"])
     assert args.orgs == ["acme"]

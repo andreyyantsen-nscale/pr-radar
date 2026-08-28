@@ -17,11 +17,16 @@ LEGEND = "✔ approved  ✗ changes requested  ● commented  · pending  * code
 DRAFT_DIVIDER_TEXT = "── DRAFTS ──"
 _DRAFT_DIVIDER = object()
 
-_MARKS = {"APPROVED": "✔", "CHANGES_REQUESTED": "✗", "COMMENTED": "●"}
-_DECISIONS = {
+_STATE_WORDS = {
     "APPROVED": "approved",
-    "CHANGES_REQUESTED": "changes requested",
-    "REVIEW_REQUIRED": "review required",
+    "CHANGES_REQUESTED": "changes_requested",
+    "COMMENTED": "commented",
+}
+_STATE_MARKS = {
+    "approved": "✔",
+    "changes_requested": "✗",
+    "commented": "●",
+    "pending": "·",
 }
 
 # SGR colour parameters. Pending marks stay uncoloured: no colour is the
@@ -259,61 +264,119 @@ def humanize(delta: timedelta) -> str:
     return "0m"
 
 
-def waiting_since(pr: dict) -> datetime:
-    """Return the moment a PR started waiting for review.
+def _waiting_since_iso(pr: dict) -> str:
+    """Return the timestamp a PR started waiting for review.
 
     Use the last READY_FOR_REVIEW event. Fall back to the PR's
     creation time when no such event exists.
     """
     ready_events = pr["timelineItems"]["nodes"]
-    timestamp = ready_events[-1]["createdAt"] if ready_events else pr["createdAt"]
-    return datetime.fromisoformat(timestamp)
+    return ready_events[-1]["createdAt"] if ready_events else pr["createdAt"]
 
 
-def reviewer_marks(pr: dict) -> dict[str, str]:
-    """Map each reviewer to a mark string.
+def waiting_since(pr: dict) -> datetime:
+    """Return the moment a PR started waiting for review."""
+    return datetime.fromisoformat(_waiting_since_iso(pr))
 
-    A login (or "#slug" for a team) maps to one mark: a verdict
-    (approved / changes requested / commented), or a pending mark
-    ("·", "·*" for a code owner). A dismissed review counts for
-    nothing. A pending request overrides an earlier verdict, because
-    a re-request voids it.
+
+def _ci_state(pr: dict) -> str | None:
+    """Return the head commit's CI rollup state, or None when absent."""
+    commit_nodes = pr["commits"]["nodes"]
+    if not commit_nodes:
+        return None
+    rollup = commit_nodes[-1]["commit"].get("statusCheckRollup")
+    return rollup["state"] if rollup else None
+
+
+def reviewer_states(pr: dict) -> list[dict]:
+    """Merge a PR's reviews and review requests into one state per reviewer.
+
+    Each entry is {"login", "state", "code_owner", "team"}; "state" is
+    approved, changes_requested, commented, or pending. A team's slug
+    goes in "login" with "team" true. A dismissed review counts for
+    nothing. A pending request overrides an earlier verdict, because a
+    re-request voids it; only pending requests carry "code_owner".
+    Order: users alphabetically by login, then teams by slug.
     """
-    marks: dict[str, str] = {}
+    users: dict[str, tuple[str, bool]] = {}
+    teams: dict[str, tuple[str, bool]] = {}
     for review in pr["latestReviews"]["nodes"]:
         author = review.get("author")
         if author is None:
             continue
-        mark = _MARKS.get(review["state"])
-        if mark is None:
+        state = _STATE_WORDS.get(review["state"])
+        if state is None:
             continue
-        marks[author["login"]] = mark
+        users[author["login"]] = (state, False)
     for request in pr["reviewRequests"]["nodes"]:
         reviewer = request.get("requestedReviewer")
         if reviewer is None:
             continue
+        code_owner = bool(request.get("asCodeOwner"))
         slug = reviewer.get("slug")
         login = reviewer.get("login")
         if slug:
-            key = f"#{slug}"
+            teams[slug] = ("pending", code_owner)
         elif login:
-            key = login
-        else:
-            continue
-        marks[key] = "·*" if request.get("asCodeOwner") else "·"
-    return marks
+            users[login] = ("pending", code_owner)
+    entries = []
+    for team, group in ((False, users), (True, teams)):
+        for login in sorted(group):
+            state, code_owner = group[login]
+            entries.append(
+                {"login": login, "state": state, "code_owner": code_owner, "team": team}
+            )
+    return entries
 
 
-def _reviewer_pairs(pr: dict) -> list[tuple[str, str]]:
-    """List a PR's (reviewer, mark) pairs, sorted and uncapped.
+def normalize_pr(node: dict) -> dict:
+    """Turn one GraphQL PR node into a complete, untruncated record.
 
-    Order: users alphabetically by login, then teams alphabetically
-    by slug.
+    Records carry everything both outputs need; nothing here is capped
+    or shortened — that is the renderer's job. Drafts get a null
+    waiting_since, matching the table's "—".
     """
-    marks = reviewer_marks(pr)
-    users = sorted(key for key in marks if not key.startswith("#"))
-    teams = sorted(key for key in marks if key.startswith("#"))
-    return [(key, marks[key]) for key in users + teams]
+    author = node.get("author")
+    decision = node["reviewDecision"]
+    return {
+        "repo": node["repository"]["nameWithOwner"],
+        "number": node["number"],
+        "url": node["url"],
+        "title": node["title"],
+        "author": (
+            None
+            if author is None
+            else {"login": author["login"], "name": author.get("name") or None}
+        ),
+        "draft": node["isDraft"],
+        "created_at": node["createdAt"],
+        "waiting_since": None if node["isDraft"] else _waiting_since_iso(node),
+        "decision": decision.lower() if decision else None,
+        "reviewers": reviewer_states(node),
+        "ci": _ci_state(node),
+        "base": node["baseRefName"],
+        "head": node["headRefName"],
+        "additions": node["additions"],
+        "deletions": node["deletions"],
+        "changed_files": node["changedFiles"],
+    }
+
+
+def _mark(entry: dict) -> str:
+    """Turn one reviewer-state entry into its table glyph."""
+    return _STATE_MARKS[entry["state"]] + ("*" if entry["code_owner"] else "")
+
+
+def _reviewer_pairs(record: dict) -> list[tuple[str, str]]:
+    """List a record's (reviewer, mark) pairs, uncapped.
+
+    Order comes from reviewer_states: users alphabetically by login,
+    then teams ("#slug") alphabetically by slug.
+    """
+    return [
+        (f"#{entry['login']}" if entry["team"] else entry["login"], _mark(entry))
+        for entry in record["reviewers"]
+    ]
 
 
 def _capped_pairs(
@@ -335,14 +398,16 @@ def _capped_pairs(
     return shown, len(pairs) - len(shown)
 
 
-def reviewer_cell(pr: dict, fmt: _Fmt = _Fmt()):
-    """Join a PR's reviewer marks into one cell.
+def reviewer_cell(record: dict, fmt: _Fmt = _Fmt()):
+    """Join a record's reviewer marks into one cell.
 
     Cap the cell at fmt.reviewer_cap entries, with a "+k" tail for the
     rest; highlighted reviewers always survive the cap. With colour on,
     return a (plain, styled) pair; the plain form drives column widths.
     """
-    pairs, hidden = _capped_pairs(_reviewer_pairs(pr), fmt.reviewer_cap, fmt.highlight)
+    pairs, hidden = _capped_pairs(
+        _reviewer_pairs(record), fmt.reviewer_cap, fmt.highlight
+    )
     texts = [f"{key}{mark}" for key, mark in pairs]
     sgrs = [_MARK_SGR.get(mark) for _, mark in pairs]
     if hidden:
@@ -351,7 +416,7 @@ def reviewer_cell(pr: dict, fmt: _Fmt = _Fmt()):
     plain = " ".join(texts)
     if not fmt.color:
         return plain
-    draft = pr["isDraft"]
+    draft = record["draft"]
     styled = " ".join(_paint(text, sgr, True, draft) for text, sgr in zip(texts, sgrs))
     return (plain, styled)
 
@@ -431,17 +496,17 @@ def classify(
     return mine, review, failed
 
 
-def _pr_cell_text(pr: dict) -> str:
-    return f"{pr['repository']['nameWithOwner']}#{pr['number']}"
+def _pr_cell_text(record: dict) -> str:
+    return f"{record['repo']}#{record['number']}"
 
 
-def _title_cell(pr: dict, fmt: _Fmt = _Fmt()) -> str:
+def _title_cell(record: dict, fmt: _Fmt = _Fmt()) -> str:
     """Fit the title into its width budget.
 
     None means uncapped. Below a 30-column budget the title first loses
     its conventional-commit prefix, then truncates with an ellipsis.
     """
-    title = pr["title"]
+    title = record["title"]
     width = fmt.title_width
     if width is None:
         return title
@@ -452,78 +517,78 @@ def _title_cell(pr: dict, fmt: _Fmt = _Fmt()) -> str:
     return title
 
 
-def _author_cell(pr: dict, login_only: bool = False) -> str:
-    author = pr.get("author")
-    login = "ghost" if author is None else author["login"]
-    name = None if author is None else author.get("name") or None
-    if login_only or not name:
-        return login
-    return f"{name} ({login})"
+def _author_cell(record: dict, login_only: bool = False) -> str:
+    author = record["author"]
+    if author is None:
+        return "ghost"
+    if login_only or not author["name"]:
+        return author["login"]
+    return f"{author['name']} ({author['login']})"
 
 
-def _decision_cell(pr: dict) -> str:
-    return _DECISIONS.get(pr["reviewDecision"], "—")
+def _decision_cell(record: dict) -> str:
+    decision = record["decision"]
+    return decision.replace("_", " ") if decision else "—"
 
 
-def _age_cell(pr: dict, now: datetime) -> str:
-    return humanize(now - datetime.fromisoformat(pr["createdAt"]))
+def _age_cell(record: dict, now: datetime) -> str:
+    return humanize(now - datetime.fromisoformat(record["created_at"]))
 
 
-def _waiting_cell(pr: dict, now: datetime) -> str:
-    if pr["isDraft"]:
+def _waiting_cell(record: dict, now: datetime) -> str:
+    if record["waiting_since"] is None:
         return "—"
-    return humanize(now - waiting_since(pr))
+    return humanize(now - datetime.fromisoformat(record["waiting_since"]))
 
 
-def _highlight_cell(pr: dict, login: str) -> str:
+def _highlight_cell(record: dict, login: str) -> str:
     login_cf = login.casefold()
-    for key, mark in reviewer_marks(pr).items():
-        if not key.startswith("#") and key.casefold() == login_cf:
-            return mark
+    for entry in record["reviewers"]:
+        if not entry["team"] and entry["login"].casefold() == login_cf:
+            return _mark(entry)
     return ""
 
 
-def _ci_cell(pr: dict) -> str:
+def _ci_cell(record: dict) -> str:
     """Show the head commit's CI status, or "none" when unavailable."""
-    commit_nodes = pr["commits"]["nodes"]
-    if not commit_nodes:
-        return "none"
-    rollup = commit_nodes[-1]["commit"].get("statusCheckRollup")
-    return rollup["state"] if rollup else "none"
+    return record["ci"] or "none"
 
 
-def _branches_cell(pr: dict) -> str:
+def _branches_cell(record: dict) -> str:
     """Show the PR's branch pair as "head → base"."""
-    return f"{pr['headRefName']} → {pr['baseRefName']}"
+    return f"{record['head']} → {record['base']}"
 
 
-def _size_cell(pr: dict) -> str:
+def _size_cell(record: dict) -> str:
     """Show the PR's diff size as "+additions/-deletions, N files"."""
-    return f"+{pr['additions']}/-{pr['deletions']}, {pr['changedFiles']} files"
+    return (
+        f"+{record['additions']}/-{record['deletions']}, "
+        f"{record['changed_files']} files"
+    )
 
 
-def _mine_cells(pr: dict, now: datetime, fmt: _Fmt) -> list:
-    draft = pr["isDraft"]
-    decision = _decision_cell(pr)
+def _mine_cells(record: dict, now: datetime, fmt: _Fmt) -> list:
+    draft = record["draft"]
+    decision = _decision_cell(record)
     return [
-        _cell(_pr_cell_text(pr), None, fmt, draft),
-        _cell(_title_cell(pr, fmt), None, fmt, draft),
-        reviewer_cell(pr, fmt),
+        _cell(_pr_cell_text(record), None, fmt, draft),
+        _cell(_title_cell(record, fmt), None, fmt, draft),
+        reviewer_cell(record, fmt),
         _cell(decision, _DECISION_SGR.get(decision), fmt, draft),
-        _cell(_age_cell(pr, now), None, fmt, draft),
-        _cell(_waiting_cell(pr, now), None, fmt, draft),
+        _cell(_age_cell(record, now), None, fmt, draft),
+        _cell(_waiting_cell(record, now), None, fmt, draft),
     ]
 
 
-def _review_cells(pr: dict, now: datetime, fmt: _Fmt) -> list:
-    draft = pr["isDraft"]
+def _review_cells(record: dict, now: datetime, fmt: _Fmt) -> list:
+    draft = record["draft"]
     return [
-        _cell(_pr_cell_text(pr), None, fmt, draft),
-        _cell(_title_cell(pr, fmt), None, fmt, draft),
-        _cell(_author_cell(pr, fmt.author_login_only), None, fmt, draft),
-        reviewer_cell(pr, fmt),
-        _cell(_age_cell(pr, now), None, fmt, draft),
-        _cell(_waiting_cell(pr, now), None, fmt, draft),
+        _cell(_pr_cell_text(record), None, fmt, draft),
+        _cell(_title_cell(record, fmt), None, fmt, draft),
+        _cell(_author_cell(record, fmt.author_login_only), None, fmt, draft),
+        reviewer_cell(record, fmt),
+        _cell(_age_cell(record, now), None, fmt, draft),
+        _cell(_waiting_cell(record, now), None, fmt, draft),
     ]
 
 
@@ -563,7 +628,7 @@ def _render_table(columns: list[str], rows: list, links: bool, color: bool) -> l
 
 
 def _fit_fmt(
-    prs: list[dict],
+    records: list[dict],
     columns: list[str],
     highlight: list[str],
     now: datetime,
@@ -586,9 +651,9 @@ def _fit_fmt(
 
     def total(fmt: _Fmt) -> int:
         widths = [len(column) for column in list(columns) + list(highlight)]
-        for pr in prs:
-            cells = cell_builder(pr, now, fmt) + [
-                _highlight_cell(pr, login) for login in highlight
+        for record in records:
+            cells = cell_builder(record, now, fmt) + [
+                _highlight_cell(record, login) for login in highlight
             ]
             for index, cell in enumerate(cells):
                 widths[index] = max(widths[index], len(_plain(cell)))
@@ -601,11 +666,14 @@ def _fit_fmt(
     if overflow <= 0:
         return fmt._replace(color=color)
 
-    title_nat = max(len("TITLE"), *(len(pr["title"]) for pr in prs))
+    title_nat = max(len("TITLE"), *(len(record["title"]) for record in records))
     if "AUTHOR" in columns:
-        author_nat = max(len("AUTHOR"), *(len(_author_cell(pr)) for pr in prs))
+        author_nat = max(
+            len("AUTHOR"), *(len(_author_cell(record)) for record in records)
+        )
         login_nat = max(
-            len("AUTHOR"), *(len(_author_cell(pr, login_only=True)) for pr in prs)
+            len("AUTHOR"),
+            *(len(_author_cell(record, login_only=True)) for record in records),
         )
         author_share = round(overflow * author_nat / (author_nat + title_nat))
         if author_share and login_nat < author_nat:
@@ -647,42 +715,49 @@ def _section_lines(
     fmt = _fit_fmt(prs, columns, highlight, now, width, cell_builder, color)
     rows = []
     divider_added = False
-    for pr in prs:
-        if pr["isDraft"] and not divider_added:
+    for record in prs:
+        if record["draft"] and not divider_added:
             rows.append(_DRAFT_DIVIDER)
             divider_added = True
-        cells = cell_builder(pr, now, fmt)
+        cells = cell_builder(record, now, fmt)
         for login in highlight:
-            mark = _highlight_cell(pr, login)
-            cells.append(_cell(mark, _MARK_SGR.get(mark), fmt, pr["isDraft"]))
-        rows.append((pr["url"], cells))
+            mark = _highlight_cell(record, login)
+            cells.append(_cell(mark, _MARK_SGR.get(mark), fmt, record["draft"]))
+        rows.append((record["url"], cells))
 
     return [header] + _render_table(columns + list(highlight), rows, links, color)
 
 
 def _detail_lines(
-    pr: dict, now: datetime, highlight: list[str], links: bool, section: str, color: bool
+    record: dict,
+    now: datetime,
+    highlight: list[str],
+    links: bool,
+    section: str,
+    color: bool,
 ) -> list[str]:
     """Render one PR as a multi-line block for the --detailed view."""
-    draft = pr["isDraft"]
+    draft = record["draft"]
 
     def p(text: str, sgr: str | None = None) -> str:
         return _paint(text, sgr, color, draft)
 
-    pr_id = p(_pr_cell_text(pr))
+    pr_id = p(_pr_cell_text(record))
     if links:
-        pr_id = f"\x1b]8;;{pr['url']}\x1b\\{pr_id}\x1b]8;;\x1b\\"
-    lines = [f"{pr_id}  {p(pr['title'])}"]
+        pr_id = f"\x1b]8;;{record['url']}\x1b\\{pr_id}\x1b]8;;\x1b\\"
+    lines = [f"{pr_id}  {p(record['title'])}"]
 
     if section == "review":
-        lines.append("  " + p(f"Author: {_author_cell(pr)}"))
+        lines.append("  " + p(f"Author: {_author_cell(record)}"))
     reviewers = " ".join(
-        p(f"{key}{mark}", _MARK_SGR.get(mark)) for key, mark in _reviewer_pairs(pr)
+        p(f"{key}{mark}", _MARK_SGR.get(mark)) for key, mark in _reviewer_pairs(record)
     )
     lines.append("  " + p("Reviewers: ") + reviewers)
 
     highlighted = [
-        (login, mark) for login in highlight if (mark := _highlight_cell(pr, login))
+        (login, mark)
+        for login in highlight
+        if (mark := _highlight_cell(record, login))
     ]
     if highlighted:
         entries = " ".join(
@@ -690,10 +765,10 @@ def _detail_lines(
         )
         lines.append("  " + p("Highlighted: ") + entries)
 
-    age = _age_cell(pr, now)
-    waiting = _waiting_cell(pr, now)
+    age = _age_cell(record, now)
+    waiting = _waiting_cell(record, now)
     if section == "mine":
-        decision = _decision_cell(pr)
+        decision = _decision_cell(record)
         lines.append(
             "  "
             + p("Decision: ")
@@ -703,12 +778,12 @@ def _detail_lines(
     else:
         lines.append("  " + p(f"Age: {age} · Waiting: {waiting}"))
 
-    ci = _ci_cell(pr)
+    ci = _ci_cell(record)
     lines.append(
         "  "
         + p("CI: ")
         + p(ci, _CI_SGR.get(ci))
-        + p(f" · Branches: {_branches_cell(pr)} · Size: {_size_cell(pr)}")
+        + p(f" · Branches: {_branches_cell(record)} · Size: {_size_cell(record)}")
     )
     return lines
 
@@ -730,14 +805,65 @@ def _detailed_section(
 
     lines = [header]
     divider_added = False
-    for pr in prs:
-        if pr["isDraft"] and not divider_added:
+    for record in prs:
+        if record["draft"] and not divider_added:
             lines.append("")
             lines.append(_paint(DRAFT_DIVIDER_TEXT, _DIVIDER_SGR, color))
             divider_added = True
         lines.append("")
-        lines.extend(_detail_lines(pr, now, highlight, links, key, color))
+        lines.extend(_detail_lines(record, now, highlight, links, key, color))
     return lines
+
+
+def _search_status(
+    results: dict[str, list[dict] | None], truncated: set[str]
+) -> dict[str, str]:
+    """Map each search that ran to its data quality.
+
+    "ok": complete. "truncated": more matches than the 100 fetched, so
+    the newest PRs are missing. "failed": the search errored and its
+    PRs are absent.
+    """
+    status = {}
+    for name, nodes in results.items():
+        if nodes is None:
+            status[name] = "failed"
+        elif name in truncated:
+            status[name] = "truncated"
+        else:
+            status[name] = "ok"
+    return status
+
+
+def build_json(
+    mine: list[dict],
+    review: list[dict],
+    now: datetime,
+    searches: dict[str, str],
+) -> str:
+    """Render the Mine and Review sections as one JSON document.
+
+    Records are complete and untruncated (see `normalize_pr`); the
+    only fields added here are the now-dependent humanized `age` and
+    `waiting`. `searches` reports per-search data quality so a
+    consumer can tell a full picture from a degraded one.
+    """
+
+    def with_durations(node: dict) -> dict:
+        record = normalize_pr(node)
+        record["age"] = _age_cell(record, now)
+        record["waiting"] = (
+            None if record["waiting_since"] is None else _waiting_cell(record, now)
+        )
+        return record
+
+    payload = {
+        "generated_at": now.isoformat(),
+        "searches": searches,
+        "mine": [with_durations(node) for node in mine],
+        "review": [with_durations(node) for node in review],
+    }
+    return json.dumps(payload, indent=2)
 
 
 def _legend(color: bool) -> str:
@@ -774,6 +900,8 @@ def build_output(
     keeps the fixed caps); in detailed mode each PR is a multi-line
     block and `width` is ignored.
     """
+    mine = [normalize_pr(node) for node in mine]
+    review = [normalize_pr(node) for node in review]
     lines = []
     if detailed:
         lines.extend(
@@ -863,7 +991,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("-r", "--highlight-reviewers", type=_split_csv, default=[])
     parser.add_argument("-d", "--detailed", action="store_true")
     parser.add_argument("-i", "--include-drafts", action="store_true")
-    return parser.parse_args(argv)
+    parser.add_argument("-j", "--json", action="store_true")
+    args = parser.parse_args(argv)
+    if args.json and (args.detailed or args.highlight_reviewers):
+        parser.error(
+            "--json cannot be combined with --detailed or --highlight-reviewers"
+        )
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -905,19 +1039,22 @@ def main(argv: list[str] | None = None) -> int:
     if review_failed:
         incomplete["review"] = review_failed
 
-    tty = sys.stdout.isatty()
-    output = build_output(
-        mine,
-        review,
-        now,
-        args.highlight_reviewers,
-        tty,
-        incomplete,
-        args.detailed,
-        color=_use_color(tty),
-        width=_effective_width(tty),
-    )
-    print(output)
+    if args.json:
+        print(build_json(mine, review, now, _search_status(results, truncated)))
+    else:
+        tty = sys.stdout.isatty()
+        output = build_output(
+            mine,
+            review,
+            now,
+            args.highlight_reviewers,
+            tty,
+            incomplete,
+            args.detailed,
+            color=_use_color(tty),
+            width=_effective_width(tty),
+        )
+        print(output)
 
     if failed and all(value is None for value in results.values()):
         return 1

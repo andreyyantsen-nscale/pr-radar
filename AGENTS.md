@@ -11,7 +11,8 @@ Terminal dashboard for pending GitHub pull requests: the PRs you opened, and the
 
 ## Layout
 
-- `src/pr_radar/__init__.py` — the whole implementation. Fetch layer (subprocess `gh` calls), pure domain functions (`classify`, `reviewer_marks`, `build_output`), CLI (`main`).
+- `src/pr_radar/__init__.py` — the whole implementation. Fetch layer (subprocess `gh` calls), pure domain functions (`classify`, `reviewer_states`, `normalize_pr`), presentation (`build_output`, `build_json`), CLI (`main`).
+- Pipeline: fetch → classify (raw GraphQL nodes: selection and ordering) → `normalize_pr` (complete, untruncated records) → present. Truncation, caps, glyphs, colours, and width fitting live only in the rendering layer; JSON dumps records verbatim.
 - `tests/helpers.py` — `make_pr` node builder and `fake_gh` runner (keyed on the full `gh` args tuple; unexpected calls fail loudly). Extend it additively; do not change existing behavior.
 - `tests/test_core.py` (domain + rendering), `tests/test_cli.py` (argparse, wiring, end-to-end with the fake runner).
 
