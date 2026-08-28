@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.0](https://github.com/andreyyantsen-nscale/pr-radar/compare/v0.1.0...v0.2.0) (2026-08-28)
+
+
+### Features
+
+* add --json output, normalize before presenting ([423eb62](https://github.com/andreyyantsen-nscale/pr-radar/commit/423eb62a35259db3e442b61e2db7e5c8b3eb83ea))
+* colour marks and fit tables to the terminal width ([4afc8a4](https://github.com/andreyyantsen-nscale/pr-radar/commit/4afc8a4742811857917325560800dc34a23e9a53))
+* exclude drafts by default, add short flags ([aefe4c2](https://github.com/andreyyantsen-nscale/pr-radar/commit/aefe4c254ab785460841b8a6392accca9f6ba522))
+
+
+### Documentation
+
+* add AGENTS.md with project conventions ([f661049](https://github.com/andreyyantsen-nscale/pr-radar/commit/f661049e4aefb0841e9879c4b7aec42e3ef6e635))
+
 ## 0.1.0 (2026-08-28)
 
 
