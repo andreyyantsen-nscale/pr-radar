@@ -291,7 +291,7 @@ def test_missing_gh_binary_is_fatal(monkeypatch, capsys):
 
     _, err = capsys.readouterr()
     assert exit_code == 1
-    assert "gh not found. Install the GitHub CLI." in err
+    assert "gh not found. Install the GitHub CLI: https://cli.github.com" in err
 
 
 def test_org_lookup_failure_is_fatal(monkeypatch, capsys):
@@ -366,3 +366,89 @@ def test_all_searches_failed_returns_1(monkeypatch):
     exit_code = pr_radar.main([])
 
     assert exit_code == 1
+
+
+def test_all_failed_surfaces_cause_and_hint(monkeypatch, capsys):
+    org_quals = ["org:acme"]
+    error = subprocess.CalledProcessError(
+        1, ["gh"], stderr="gh: Bad credentials (HTTP 401)\n"
+    )
+    responses = {
+        tuple(pr_radar.ORG_LOOKUP_ARGS): "acme\n",
+        tuple(pr_radar.TEAM_LOOKUP_ARGS): "",
+        tuple(_search_args("mine", org_quals)): error,
+        tuple(_search_args("requested", org_quals)): error,
+        tuple(_search_args("reviewed", org_quals)): error,
+    }
+    monkeypatch.setattr(pr_radar, "run_gh", fake_gh(responses))
+
+    exit_code = pr_radar.main([])
+
+    out, err = capsys.readouterr()
+    assert exit_code == 1
+    assert "every search failed:" in err
+    assert "Bad credentials" in err
+    assert "gh auth login" in err
+    assert "MY OPEN PULL REQUESTS" not in out
+
+
+def test_all_failed_json_emits_no_stdout(monkeypatch, capsys):
+    org_quals = ["org:acme"]
+    error = subprocess.CalledProcessError(
+        1, ["gh"], stderr="gh: Bad credentials (HTTP 401)\n"
+    )
+    responses = {
+        tuple(pr_radar.ORG_LOOKUP_ARGS): "acme\n",
+        tuple(pr_radar.TEAM_LOOKUP_ARGS): "",
+        tuple(_search_args("mine", org_quals)): error,
+        tuple(_search_args("requested", org_quals)): error,
+        tuple(_search_args("reviewed", org_quals)): error,
+    }
+    monkeypatch.setattr(pr_radar, "run_gh", fake_gh(responses))
+
+    exit_code = pr_radar.main(["-j"])
+
+    out, _ = capsys.readouterr()
+    assert exit_code == 1
+    assert out == ""
+
+
+def test_all_failed_without_auth_marker_has_no_hint(monkeypatch, capsys):
+    org_quals = ["org:acme"]
+    error = subprocess.CalledProcessError(1, ["gh"], stderr="boom\n")
+    responses = {
+        tuple(pr_radar.ORG_LOOKUP_ARGS): "acme\n",
+        tuple(pr_radar.TEAM_LOOKUP_ARGS): "",
+        tuple(_search_args("mine", org_quals)): error,
+        tuple(_search_args("requested", org_quals)): error,
+        tuple(_search_args("reviewed", org_quals)): error,
+    }
+    monkeypatch.setattr(pr_radar, "run_gh", fake_gh(responses))
+
+    exit_code = pr_radar.main([])
+
+    _, err = capsys.readouterr()
+    assert exit_code == 1
+    assert "every search failed: boom" in err
+    assert "gh auth login" not in err
+
+
+def test_org_lookup_auth_failure_adds_hint(monkeypatch, capsys):
+    org_quals = ["org:acme"]
+    error = subprocess.CalledProcessError(
+        1, ["gh"], stderr="gh: Bad credentials (HTTP 401)\n"
+    )
+    responses = {
+        tuple(pr_radar.ORG_LOOKUP_ARGS): error,
+        tuple(pr_radar.TEAM_LOOKUP_ARGS): "",
+        tuple(_search_args("mine", org_quals)): search_response([]),
+        tuple(_search_args("requested", org_quals)): search_response([]),
+        tuple(_search_args("reviewed", org_quals)): search_response([]),
+    }
+    monkeypatch.setattr(pr_radar, "run_gh", fake_gh(responses))
+
+    exit_code = pr_radar.main([])
+
+    _, err = capsys.readouterr()
+    assert exit_code == 1
+    assert "gh auth login" in err

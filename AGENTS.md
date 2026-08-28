@@ -23,7 +23,7 @@ Terminal dashboard for pending GitHub pull requests: the PRs you opened, and the
 - Four searches run in parallel threads. A single aliased GraphQL document was measured slower (4.6 s vs 3.2 s); do not "simplify" back to one request without re-measuring.
 - A separate `team-review-requested:` search exists because `review-requested:@me` does not match team-routed requests.
 - Search strings end in `sort:created-asc` so the 100-result cap drops the newest (least-waiting) PRs, never the longest-waiting head.
-- One failed search degrades its section (header gets an `(incomplete: ...)` suffix); the run fails only when every search fails.
+- One failed search degrades its section (header gets an `(incomplete: ...)` suffix); the run fails only when every search fails. When every search fails, the run prints the first error to stderr, skips the dashboard, and exits 1.
 - Python ≥ 3.11: `datetime.fromisoformat` accepts the API's trailing `Z` only from 3.11.
 - Dependencies: runtime was stdlib-only while the tool was run from a checkout. The package now ships via PyPI, so reasonable runtime dependencies are acceptable when they pay for themselves.
 - WAITING is PR-level (time since draft→ready), also the Review section's sort key. The re-review filter compares the viewer's last review to the last commit's `committedDate`, which is author-controlled — a known, documented limitation.

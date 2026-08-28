@@ -114,6 +114,26 @@ def run_gh(args: list[str]) -> str:
     ).stdout
 
 
+def _error_text(exc: Exception) -> str:
+    """Return a message for an exception.
+
+    Subprocess errors carry gh's stderr. Other errors fall back to
+    their message.
+    """
+    return (getattr(exc, "stderr", None) or str(exc) or exc.__class__.__name__).strip()
+
+
+def _auth_hint(error_text: str) -> str | None:
+    """Return an auth hint when the error text names a login problem.
+
+    Return None when the text carries no such marker.
+    """
+    markers = ("401", "bad credentials", "auth login", "not logged in")
+    if any(marker in error_text.lower() for marker in markers):
+        return "gh is not authenticated. Run: gh auth login"
+    return None
+
+
 def _tick() -> None:
     """Print one flushed progress dot to stderr."""
     print(".", end="", file=sys.stderr, flush=True)
@@ -147,12 +167,13 @@ def _search_query(
 
 def fetch_pull_requests(
     orgs: list[str] | None, all_orgs: bool, include_drafts: bool = False
-) -> tuple[dict[str, list[dict] | None], set[str], str]:
+) -> tuple[dict[str, list[dict] | None], set[str], str, dict[str, str]]:
     """Resolve scope, then run the four PR searches.
 
     Return the per-search PR nodes (a failed search maps to None), the
-    names of searches truncated at 100 results, and the viewer's login
-    from the first successful search.
+    names of searches truncated at 100 results, the viewer's login
+    from the first successful search, and an error text per failed
+    search (also keyed "team" for a team-lookup failure).
 
     An org-lookup failure is fatal and propagates to the caller. A
     team-lookup failure degrades the "team" search itself to a failure,
@@ -162,6 +183,7 @@ def fetch_pull_requests(
     results: dict[str, list[dict] | None] = {}
     truncated: set[str] = set()
     viewer_login = ""
+    errors: dict[str, str] = {}
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         need_org_lookup = orgs is None and not all_orgs
@@ -188,8 +210,9 @@ def fetch_pull_requests(
                     team_logins = _split_lines(future.result())
                 except FileNotFoundError:
                     raise
-                except Exception:
+                except Exception as exc:
                     team_lookup_failed = True
+                    errors["team"] = _error_text(exc)
 
         if team_lookup_failed:
             results["team"] = None
@@ -224,8 +247,9 @@ def fetch_pull_requests(
                 data = json.loads(future.result())["data"]
             except FileNotFoundError:
                 raise
-            except Exception:
+            except Exception as exc:
                 results[name] = None
+                errors[name] = _error_text(exc)
                 continue
             search = data["search"]
             nodes = search["nodes"]
@@ -237,7 +261,7 @@ def fetch_pull_requests(
                 if login:
                     viewer_login = login
 
-    return results, truncated, viewer_login
+    return results, truncated, viewer_login, errors
 
 
 def humanize(delta: timedelta) -> str:
@@ -1010,16 +1034,22 @@ def main(argv: list[str] | None = None) -> int:
 
     print("Fetching pull requests...", end="", file=sys.stderr, flush=True)
     try:
-        results, truncated, viewer_login = fetch_pull_requests(
+        results, truncated, viewer_login, errors = fetch_pull_requests(
             args.orgs, args.all, args.include_drafts
         )
     except FileNotFoundError:
         print(file=sys.stderr)
-        print("gh not found. Install the GitHub CLI.", file=sys.stderr)
+        print(
+            "gh not found. Install the GitHub CLI: https://cli.github.com",
+            file=sys.stderr,
+        )
         return 1
     except subprocess.CalledProcessError as exc:
         print(file=sys.stderr)
         print((exc.stderr or "").rstrip("\n"), file=sys.stderr)
+        hint = _auth_hint(exc.stderr or "")
+        if hint is not None:
+            print(hint, file=sys.stderr)
         return 1
 
     mine, review, failed = classify(results, viewer_login)
@@ -1030,6 +1060,14 @@ def main(argv: list[str] | None = None) -> int:
         f" done (mine {len(mine)}, to review {len(review)}){trunc_suffix}{failed_suffix}",
         file=sys.stderr,
     )
+
+    if failed and all(value is None for value in results.values()):
+        error_text = errors.get(failed[0], "")
+        print(f"every search failed: {error_text}", file=sys.stderr)
+        hint = _auth_hint(error_text)
+        if hint is not None:
+            print(hint, file=sys.stderr)
+        return 1
 
     incomplete: dict[str, list[str]] = {}
     mine_failed = [name for name in failed if name == "mine"]
@@ -1056,6 +1094,4 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(output)
 
-    if failed and all(value is None for value in results.values()):
-        return 1
     return 0
