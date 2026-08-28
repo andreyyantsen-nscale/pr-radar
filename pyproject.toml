@@ -1,6 +1,6 @@
 [project]
 name = "pr-radar"
-version = "0.2.0"
+version = "0.2.1"
 description = "Terminal dashboard for your pending GitHub pull requests"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
