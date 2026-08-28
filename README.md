@@ -20,12 +20,13 @@ Once the first release is published, `uvx pr-radar` runs it without installing a
 ## Usage
 
 ```sh
-pr-radar [--orgs a,b | --all] [--highlight-reviewers u1,u2] [--detailed]
+pr-radar [-o a,b | -a] [-r u1,u2] [-d] [-i]
 ```
 
-- Default scope: the orgs you belong to. `--orgs a,b` overrides the list. `--all` searches all of github.com.
-- `--highlight-reviewers u1,u2` adds one column per login. The cell shows that person's review state on each PR.
-- `--detailed` prints each PR as a multi-line block instead of a table row: full title, uncapped reviewer list, CI status, branches, and change size. With `--highlight-reviewers`, an extra line names the highlighted people on each PR they touch.
+- Default scope: the orgs you belong to. `-o`/`--orgs a,b` overrides the list. `-a`/`--all` searches all of github.com.
+- `-r`/`--highlight-reviewers u1,u2` adds one column per login. The cell shows that person's review state on each PR.
+- `-d`/`--detailed` prints each PR as a multi-line block instead of a table row: full title, uncapped reviewer list, CI status, branches, and change size. With `--highlight-reviewers`, an extra line names the highlighted people on each PR they touch.
+- `-i`/`--include-drafts` adds draft PRs, listed after a `── DRAFTS ──` divider. The default shows only ready PRs.
 
 Each PR cell is a clickable hyperlink in terminals that support OSC 8 (iTerm2 and others). Piped output contains no escape bytes.
 

@@ -10,9 +10,11 @@ from helpers import fake_gh, make_pr, search_response
 import pr_radar
 
 
-def _search_args(name, org_quals=(), team_quals=()):
+def _search_args(name, org_quals=(), team_quals=(), include_drafts=False):
     """Build the exact gh args a search call makes, for fake_gh keys."""
-    query = pr_radar._search_query(name, list(org_quals), list(team_quals))
+    query = pr_radar._search_query(
+        name, list(org_quals), list(team_quals), include_drafts
+    )
     return [
         "api",
         "graphql",
@@ -48,6 +50,37 @@ def test_detailed_flag_defaults_false():
 def test_detailed_flag_parses_true():
     args = pr_radar._parse_args(["--detailed"])
     assert args.detailed is True
+
+
+def test_include_drafts_defaults_false():
+    args = pr_radar._parse_args([])
+    assert args.include_drafts is False
+
+
+def test_include_drafts_flag_parses_true():
+    args = pr_radar._parse_args(["--include-drafts"])
+    assert args.include_drafts is True
+
+
+def test_short_flags_parse_like_long_forms():
+    args = pr_radar._parse_args(["-o", "acme", "-r", "alice", "-d", "-i"])
+    assert args.orgs == ["acme"]
+    assert args.highlight_reviewers == ["alice"]
+    assert args.detailed is True
+    assert args.include_drafts is True
+    assert pr_radar._parse_args(["-a"]).all is True
+
+
+def test_search_query_excludes_drafts_by_default():
+    query = pr_radar._search_query("mine", [], [])
+    assert "draft:false" in query
+    assert query.endswith("sort:created-asc")
+
+
+def test_search_query_keeps_drafts_when_included():
+    query = pr_radar._search_query("mine", [], [], include_drafts=True)
+    assert "draft:false" not in query
+    assert query.endswith("sort:created-asc")
 
 
 # --- colour and width gates ---------------------------------------------------
@@ -138,15 +171,19 @@ def test_end_to_end_renders_expected_structure(monkeypatch, capsys):
     responses = {
         tuple(pr_radar.ORG_LOOKUP_ARGS): "acme\n",
         tuple(pr_radar.TEAM_LOOKUP_ARGS): "",
-        tuple(_search_args("mine", org_quals)): search_response([]),
-        tuple(_search_args("requested", org_quals)): search_response(
-            [new, old, draft], issue_count=150
+        tuple(_search_args("mine", org_quals, include_drafts=True)): search_response(
+            []
         ),
-        tuple(_search_args("reviewed", org_quals)): search_response([]),
+        tuple(
+            _search_args("requested", org_quals, include_drafts=True)
+        ): search_response([new, old, draft], issue_count=150),
+        tuple(
+            _search_args("reviewed", org_quals, include_drafts=True)
+        ): search_response([]),
     }
     monkeypatch.setattr(pr_radar, "run_gh", fake_gh(responses))
 
-    exit_code = pr_radar.main([])
+    exit_code = pr_radar.main(["--include-drafts"])
 
     out, err = capsys.readouterr()
 

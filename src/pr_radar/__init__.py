@@ -119,19 +119,29 @@ def _split_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def _search_query(name: str, org_quals: list[str], team_quals: list[str]) -> str:
-    """Build one search's query string, ending in sort:created-asc."""
+def _search_query(
+    name: str,
+    org_quals: list[str],
+    team_quals: list[str],
+    include_drafts: bool = False,
+) -> str:
+    """Build one search's query string, ending in sort:created-asc.
+
+    Drafts are excluded in the query itself, so they do not consume
+    slots in the 100-result cap.
+    """
     base = {
         "mine": ["is:pr", "is:open", "author:@me"],
         "requested": ["is:pr", "is:open", "review-requested:@me"],
         "reviewed": ["is:pr", "is:open", "reviewed-by:@me", "-author:@me"],
         "team": ["is:pr", "is:open", "-author:@me", *team_quals],
     }[name]
-    return " ".join([*base, *org_quals, "sort:created-asc"])
+    draft_qual = [] if include_drafts else ["draft:false"]
+    return " ".join([*base, *org_quals, *draft_qual, "sort:created-asc"])
 
 
 def fetch_pull_requests(
-    orgs: list[str] | None, all_orgs: bool
+    orgs: list[str] | None, all_orgs: bool, include_drafts: bool = False
 ) -> tuple[dict[str, list[dict] | None], set[str], str]:
     """Resolve scope, then run the four PR searches.
 
@@ -194,7 +204,7 @@ def fetch_pull_requests(
                     "api",
                     "graphql",
                     "-f",
-                    f"q={_search_query(name, org_quals, team_quals)}",
+                    f"q={_search_query(name, org_quals, team_quals, include_drafts)}",
                     "-f",
                     f"query={GRAPHQL_QUERY}",
                 ],
@@ -848,10 +858,11 @@ def _split_csv(value: str) -> list[str]:
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="pr-radar")
     scope = parser.add_mutually_exclusive_group()
-    scope.add_argument("--orgs", type=_split_csv, default=None)
-    scope.add_argument("--all", action="store_true")
-    parser.add_argument("--highlight-reviewers", type=_split_csv, default=[])
-    parser.add_argument("--detailed", action="store_true")
+    scope.add_argument("-o", "--orgs", type=_split_csv, default=None)
+    scope.add_argument("-a", "--all", action="store_true")
+    parser.add_argument("-r", "--highlight-reviewers", type=_split_csv, default=[])
+    parser.add_argument("-d", "--detailed", action="store_true")
+    parser.add_argument("-i", "--include-drafts", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -865,7 +876,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print("Fetching pull requests...", end="", file=sys.stderr, flush=True)
     try:
-        results, truncated, viewer_login = fetch_pull_requests(args.orgs, args.all)
+        results, truncated, viewer_login = fetch_pull_requests(
+            args.orgs, args.all, args.include_drafts
+        )
     except FileNotFoundError:
         print(file=sys.stderr)
         print("gh not found. Install the GitHub CLI.", file=sys.stderr)
