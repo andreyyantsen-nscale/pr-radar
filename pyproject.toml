@@ -3,6 +3,8 @@ name = "pr-radar"
 version = "0.1.0"
 description = "Terminal dashboard for your pending GitHub pull requests"
 readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-*"]
 authors = [
     { name = "Andrey Yantsen", email = "andrey.yantsen@nscale.com" }
 ]
