@@ -1,5 +1,6 @@
 """Tests for pr-radar's CLI: argument parsing, fetch wiring, end-to-end runs."""
 
+import os
 import subprocess
 
 import pytest
@@ -47,6 +48,52 @@ def test_detailed_flag_defaults_false():
 def test_detailed_flag_parses_true():
     args = pr_radar._parse_args(["--detailed"])
     assert args.detailed is True
+
+
+# --- colour and width gates ---------------------------------------------------
+
+
+def test_use_color_requires_a_tty(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    assert pr_radar._use_color(True) is True
+    assert pr_radar._use_color(False) is False
+
+
+def test_use_color_respects_no_color(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    assert pr_radar._use_color(True) is False
+
+
+def test_use_color_empty_no_color_does_not_disable(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    assert pr_radar._use_color(True) is True
+
+
+def test_use_color_respects_dumb_term(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "dumb")
+    assert pr_radar._use_color(True) is False
+
+
+def test_effective_width_none_when_piped():
+    assert pr_radar._effective_width(False) is None
+
+
+def test_effective_width_floored_at_80(monkeypatch):
+    monkeypatch.setattr(
+        pr_radar.shutil, "get_terminal_size", lambda: os.terminal_size((60, 24))
+    )
+    assert pr_radar._effective_width(True) == 80
+
+
+def test_effective_width_uses_terminal_columns(monkeypatch):
+    monkeypatch.setattr(
+        pr_radar.shutil, "get_terminal_size", lambda: os.terminal_size((132, 24))
+    )
+    assert pr_radar._effective_width(True) == 132
 
 
 # --- highlight matching -----------------------------------------------------

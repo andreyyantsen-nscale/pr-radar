@@ -3,9 +3,13 @@
 import argparse
 import concurrent.futures
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 MINE_COLUMNS = ["PR", "TITLE", "REVIEWERS", "DECISION", "AGE", "WAITING"]
 REVIEW_COLUMNS = ["PR", "TITLE", "AUTHOR", "REVIEWERS", "AGE", "WAITING"]
@@ -19,6 +23,58 @@ _DECISIONS = {
     "CHANGES_REQUESTED": "changes requested",
     "REVIEW_REQUIRED": "review required",
 }
+
+# SGR colour parameters. Pending marks stay uncoloured: no colour is the
+# neutral state's colour.
+_MARK_SGR = {"✔": "32", "✗": "31", "●": "33"}
+_DECISION_SGR = {"approved": "32", "changes requested": "31"}
+_CI_SGR = {"SUCCESS": "32", "FAILURE": "31", "ERROR": "31", "PENDING": "33"}
+_DRAFT_SGR = "90"
+_DIVIDER_SGR = "2;90"
+
+# A conventional-commit prefix, e.g. "feat(api): ". Lowercase types only,
+# so markers like "WIP:" survive.
+_CONVENTIONAL_PREFIX = re.compile(r"^[a-z]+(\([^)]*\))?!?: ")
+
+
+class _Fmt(NamedTuple):
+    """Per-table rendering budgets, negotiated against the terminal width."""
+
+    title_width: int | None = 50
+    author_login_only: bool = False
+    reviewer_cap: int = 6
+    highlight: tuple[str, ...] = ()  # casefolded logins
+    color: bool = False
+
+
+def _paint(text: str, sgr: str | None, color: bool, draft: bool = False) -> str:
+    """Wrap text in one SGR sequence, or return it unchanged.
+
+    In a draft row plain text turns grey and coloured marks turn faint,
+    so drafts recede but their status stays legible.
+    """
+    if not color or not text:
+        return text
+    if draft:
+        sgr = f"2;{sgr}" if sgr else _DRAFT_SGR
+    if not sgr:
+        return text
+    return f"\x1b[{sgr}m{text}\x1b[0m"
+
+
+def _cell(text: str, sgr: str | None, fmt: _Fmt, draft: bool):
+    """One table cell: plain, or a (plain, styled) pair when colour is on."""
+    if not fmt.color:
+        return text
+    return (text, _paint(text, sgr, True, draft))
+
+
+def _plain(cell) -> str:
+    return cell[0] if isinstance(cell, tuple) else cell
+
+
+def _display(cell) -> str:
+    return cell[1] if isinstance(cell, tuple) else cell
 
 ORG_LOOKUP_ARGS = ["api", "user/orgs", "--jq", ".[].login"]
 TEAM_LOOKUP_ARGS = ["api", "user/teams", "--jq", '.[] | .organization.login + "/" + .slug']
@@ -238,8 +294,8 @@ def reviewer_marks(pr: dict) -> dict[str, str]:
     return marks
 
 
-def _reviewer_entries(pr: dict) -> list[str]:
-    """List a PR's reviewer marks, sorted and uncapped.
+def _reviewer_pairs(pr: dict) -> list[tuple[str, str]]:
+    """List a PR's (reviewer, mark) pairs, sorted and uncapped.
 
     Order: users alphabetically by login, then teams alphabetically
     by slug.
@@ -247,19 +303,47 @@ def _reviewer_entries(pr: dict) -> list[str]:
     marks = reviewer_marks(pr)
     users = sorted(key for key in marks if not key.startswith("#"))
     teams = sorted(key for key in marks if key.startswith("#"))
-    return [f"{key}{marks[key]}" for key in users + teams]
+    return [(key, marks[key]) for key in users + teams]
 
 
-def reviewer_cell(pr: dict) -> str:
+def _capped_pairs(
+    pairs: list[tuple[str, str]], cap: int, highlight: tuple[str, ...]
+) -> tuple[list[tuple[str, str]], int]:
+    """Cap the pair list, keeping every highlighted reviewer.
+
+    Return the shown pairs (in their original order) and the hidden
+    count. Non-highlighted pairs fill the cap in order.
+    """
+    if len(pairs) <= cap:
+        return pairs, 0
+    keep = {key for key, _ in pairs if key.casefold() in highlight}
+    for key, _ in pairs:
+        if len(keep) >= cap:
+            break
+        keep.add(key)
+    shown = [(key, mark) for key, mark in pairs if key in keep]
+    return shown, len(pairs) - len(shown)
+
+
+def reviewer_cell(pr: dict, fmt: _Fmt = _Fmt()):
     """Join a PR's reviewer marks into one cell.
 
-    Cap the cell at 6 entries, with a "+k" tail for the rest, so a PR
-    with many reviewers cannot wrap the row.
+    Cap the cell at fmt.reviewer_cap entries, with a "+k" tail for the
+    rest; highlighted reviewers always survive the cap. With colour on,
+    return a (plain, styled) pair; the plain form drives column widths.
     """
-    entries = _reviewer_entries(pr)
-    if len(entries) > 6:
-        entries = entries[:6] + [f"+{len(entries) - 6}"]
-    return " ".join(entries)
+    pairs, hidden = _capped_pairs(_reviewer_pairs(pr), fmt.reviewer_cap, fmt.highlight)
+    texts = [f"{key}{mark}" for key, mark in pairs]
+    sgrs = [_MARK_SGR.get(mark) for _, mark in pairs]
+    if hidden:
+        texts.append(f"+{hidden}")
+        sgrs.append(None)
+    plain = " ".join(texts)
+    if not fmt.color:
+        return plain
+    draft = pr["isDraft"]
+    styled = " ".join(_paint(text, sgr, True, draft) for text, sgr in zip(texts, sgrs))
+    return (plain, styled)
 
 
 def _passes_freshness_filter(pr: dict, viewer_login: str) -> bool:
@@ -341,18 +425,30 @@ def _pr_cell_text(pr: dict) -> str:
     return f"{pr['repository']['nameWithOwner']}#{pr['number']}"
 
 
-def _title_cell(pr: dict) -> str:
+def _title_cell(pr: dict, fmt: _Fmt = _Fmt()) -> str:
+    """Fit the title into its width budget.
+
+    None means uncapped. Below a 30-column budget the title first loses
+    its conventional-commit prefix, then truncates with an ellipsis.
+    """
     title = pr["title"]
-    if len(title) > 50:
-        return title[:49] + "…"
+    width = fmt.title_width
+    if width is None:
+        return title
+    if width < 30:
+        title = _CONVENTIONAL_PREFIX.sub("", title, count=1)
+    if len(title) > width:
+        return title[: width - 1] + "…"
     return title
 
 
-def _author_cell(pr: dict) -> str:
+def _author_cell(pr: dict, login_only: bool = False) -> str:
     author = pr.get("author")
     login = "ghost" if author is None else author["login"]
     name = None if author is None else author.get("name") or None
-    return f"{name} ({login})" if name else login
+    if login_only or not name:
+        return login
+    return f"{name} ({login})"
 
 
 def _decision_cell(pr: dict) -> str:
@@ -377,19 +473,6 @@ def _highlight_cell(pr: dict, login: str) -> str:
     return ""
 
 
-def _highlighted_line(pr: dict, highlight: list[str]) -> str | None:
-    """Build the "Highlighted: ..." detailed-view line, or None.
-
-    Return None when no highlighted login has a mark on this PR.
-    """
-    entries = [
-        f"{login}{mark}" for login in highlight if (mark := _highlight_cell(pr, login))
-    ]
-    if not entries:
-        return None
-    return "Highlighted: " + " ".join(entries)
-
-
 def _ci_cell(pr: dict) -> str:
     """Show the head commit's CI status, or "none" when unavailable."""
     commit_nodes = pr["commits"]["nodes"]
@@ -409,58 +492,119 @@ def _size_cell(pr: dict) -> str:
     return f"+{pr['additions']}/-{pr['deletions']}, {pr['changedFiles']} files"
 
 
-def _mine_cells(pr: dict, now: datetime) -> list[str]:
+def _mine_cells(pr: dict, now: datetime, fmt: _Fmt) -> list:
+    draft = pr["isDraft"]
+    decision = _decision_cell(pr)
     return [
-        _pr_cell_text(pr),
-        _title_cell(pr),
-        reviewer_cell(pr),
-        _decision_cell(pr),
-        _age_cell(pr, now),
-        _waiting_cell(pr, now),
+        _cell(_pr_cell_text(pr), None, fmt, draft),
+        _cell(_title_cell(pr, fmt), None, fmt, draft),
+        reviewer_cell(pr, fmt),
+        _cell(decision, _DECISION_SGR.get(decision), fmt, draft),
+        _cell(_age_cell(pr, now), None, fmt, draft),
+        _cell(_waiting_cell(pr, now), None, fmt, draft),
     ]
 
 
-def _review_cells(pr: dict, now: datetime) -> list[str]:
+def _review_cells(pr: dict, now: datetime, fmt: _Fmt) -> list:
+    draft = pr["isDraft"]
     return [
-        _pr_cell_text(pr),
-        _title_cell(pr),
-        _author_cell(pr),
-        reviewer_cell(pr),
-        _age_cell(pr, now),
-        _waiting_cell(pr, now),
+        _cell(_pr_cell_text(pr), None, fmt, draft),
+        _cell(_title_cell(pr, fmt), None, fmt, draft),
+        _cell(_author_cell(pr, fmt.author_login_only), None, fmt, draft),
+        reviewer_cell(pr, fmt),
+        _cell(_age_cell(pr, now), None, fmt, draft),
+        _cell(_waiting_cell(pr, now), None, fmt, draft),
     ]
 
 
-def _pad_row(cells: list[str], widths: list[int], url: str | None, links: bool) -> str:
+def _pad_row(cells: list, widths: list[int], url: str | None, links: bool) -> str:
     parts = []
     last = len(cells) - 1
     for index, cell in enumerate(cells):
-        text = cell
+        text = _display(cell)
         if index == 0 and links and url:
-            text = f"\x1b]8;;{url}\x1b\\{cell}\x1b]8;;\x1b\\"
+            text = f"\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\"
         if index < last:
-            text += " " * (widths[index] - len(cell))
+            text += " " * (widths[index] - len(_plain(cell)))
         parts.append(text)
     return "  ".join(parts)
 
 
-def _render_table(columns: list[str], rows: list, links: bool) -> list[str]:
+def _render_table(columns: list[str], rows: list, links: bool, color: bool) -> list[str]:
     widths = [len(column) for column in columns]
     for row in rows:
         if row is _DRAFT_DIVIDER:
             continue
         _, cells = row
         for index, cell in enumerate(cells):
-            widths[index] = max(widths[index], len(cell))
+            widths[index] = max(widths[index], len(_plain(cell)))
+
+    total_width = sum(widths) + 2 * (len(widths) - 1)
+    divider = DRAFT_DIVIDER_TEXT + "─" * max(0, total_width - len(DRAFT_DIVIDER_TEXT))
 
     lines = [_pad_row(columns, widths, None, False)]
     for row in rows:
         if row is _DRAFT_DIVIDER:
-            lines.append(DRAFT_DIVIDER_TEXT)
+            lines.append(_paint(divider, _DIVIDER_SGR, color))
             continue
         url, cells = row
         lines.append(_pad_row(cells, widths, url, links))
     return lines
+
+
+def _fit_fmt(
+    prs: list[dict],
+    columns: list[str],
+    highlight: list[str],
+    now: datetime,
+    width: int | None,
+    cell_builder,
+    color: bool,
+) -> _Fmt:
+    """Negotiate one table's rendering budgets against the terminal width.
+
+    With no width (piped output) keep the fixed caps: TITLE 50, 6
+    reviewer entries, full author names. Otherwise give every column its
+    natural width; on overflow reduce the reviewer cap (floor 2), then
+    shrink AUTHOR (full name drops to the bare login) and TITLE
+    (floor 15) in proportion to their natural widths. A row that still
+    overflows with every floor hit wraps in the terminal.
+    """
+    highlight_cf = tuple(login.casefold() for login in highlight)
+    if width is None:
+        return _Fmt(50, False, 6, highlight_cf, color)
+
+    def total(fmt: _Fmt) -> int:
+        widths = [len(column) for column in list(columns) + list(highlight)]
+        for pr in prs:
+            cells = cell_builder(pr, now, fmt) + [
+                _highlight_cell(pr, login) for login in highlight
+            ]
+            for index, cell in enumerate(cells):
+                widths[index] = max(widths[index], len(_plain(cell)))
+        return sum(widths) + 2 * (len(widths) - 1)
+
+    fmt = _Fmt(None, False, 6, highlight_cf, False)
+    while fmt.reviewer_cap > 2 and total(fmt) > width:
+        fmt = fmt._replace(reviewer_cap=fmt.reviewer_cap - 1)
+    overflow = total(fmt) - width
+    if overflow <= 0:
+        return fmt._replace(color=color)
+
+    title_nat = max(len("TITLE"), *(len(pr["title"]) for pr in prs))
+    if "AUTHOR" in columns:
+        author_nat = max(len("AUTHOR"), *(len(_author_cell(pr)) for pr in prs))
+        login_nat = max(
+            len("AUTHOR"), *(len(_author_cell(pr, login_only=True)) for pr in prs)
+        )
+        author_share = round(overflow * author_nat / (author_nat + title_nat))
+        if author_share and login_nat < author_nat:
+            fmt = fmt._replace(author_login_only=True)
+            overflow -= author_nat - login_nat
+    title_width = max(15, title_nat - max(overflow, 0))
+    if title_width < title_nat:
+        fmt = fmt._replace(title_width=title_width)
+    return fmt._replace(color=color)
 
 
 def _section_header(title: str, key: str, incomplete: dict[str, list[str]]) -> str:
@@ -483,51 +627,78 @@ def _section_lines(
     incomplete: dict[str, list[str]],
     columns: list[str],
     cell_builder,
+    color: bool,
+    width: int | None,
 ) -> list[str]:
     header = _section_header(title, key, incomplete)
     if not prs:
         return [header + "  (none)"]
 
+    fmt = _fit_fmt(prs, columns, highlight, now, width, cell_builder, color)
     rows = []
     divider_added = False
     for pr in prs:
         if pr["isDraft"] and not divider_added:
             rows.append(_DRAFT_DIVIDER)
             divider_added = True
-        cells = cell_builder(pr, now) + [
-            _highlight_cell(pr, login) for login in highlight
-        ]
+        cells = cell_builder(pr, now, fmt)
+        for login in highlight:
+            mark = _highlight_cell(pr, login)
+            cells.append(_cell(mark, _MARK_SGR.get(mark), fmt, pr["isDraft"]))
         rows.append((pr["url"], cells))
 
-    return [header] + _render_table(columns + list(highlight), rows, links)
+    return [header] + _render_table(columns + list(highlight), rows, links, color)
 
 
 def _detail_lines(
-    pr: dict, now: datetime, highlight: list[str], links: bool, section: str
+    pr: dict, now: datetime, highlight: list[str], links: bool, section: str, color: bool
 ) -> list[str]:
     """Render one PR as a multi-line block for the --detailed view."""
-    pr_id = _pr_cell_text(pr)
+    draft = pr["isDraft"]
+
+    def p(text: str, sgr: str | None = None) -> str:
+        return _paint(text, sgr, color, draft)
+
+    pr_id = p(_pr_cell_text(pr))
     if links:
         pr_id = f"\x1b]8;;{pr['url']}\x1b\\{pr_id}\x1b]8;;\x1b\\"
-    lines = [f"{pr_id}  {pr['title']}"]
+    lines = [f"{pr_id}  {p(pr['title'])}"]
 
     if section == "review":
-        lines.append(f"  Author: {_author_cell(pr)}")
-    lines.append(f"  Reviewers: {' '.join(_reviewer_entries(pr))}")
+        lines.append("  " + p(f"Author: {_author_cell(pr)}"))
+    reviewers = " ".join(
+        p(f"{key}{mark}", _MARK_SGR.get(mark)) for key, mark in _reviewer_pairs(pr)
+    )
+    lines.append("  " + p("Reviewers: ") + reviewers)
 
-    highlighted = _highlighted_line(pr, highlight)
-    if highlighted is not None:
-        lines.append(f"  {highlighted}")
+    highlighted = [
+        (login, mark) for login in highlight if (mark := _highlight_cell(pr, login))
+    ]
+    if highlighted:
+        entries = " ".join(
+            p(f"{login}{mark}", _MARK_SGR.get(mark)) for login, mark in highlighted
+        )
+        lines.append("  " + p("Highlighted: ") + entries)
 
     age = _age_cell(pr, now)
     waiting = _waiting_cell(pr, now)
     if section == "mine":
-        lines.append(f"  Decision: {_decision_cell(pr)} · Age: {age} · Waiting: {waiting}")
+        decision = _decision_cell(pr)
+        lines.append(
+            "  "
+            + p("Decision: ")
+            + p(decision, _DECISION_SGR.get(decision))
+            + p(f" · Age: {age} · Waiting: {waiting}")
+        )
     else:
-        lines.append(f"  Age: {age} · Waiting: {waiting}")
+        lines.append("  " + p(f"Age: {age} · Waiting: {waiting}"))
 
+    ci = _ci_cell(pr)
     lines.append(
-        f"  CI: {_ci_cell(pr)} · Branches: {_branches_cell(pr)} · Size: {_size_cell(pr)}"
+        "  "
+        + p("CI: ")
+        + p(ci, _CI_SGR.get(ci))
+        + p(f" · Branches: {_branches_cell(pr)} · Size: {_size_cell(pr)}")
     )
     return lines
 
@@ -540,6 +711,7 @@ def _detailed_section(
     links: bool,
     highlight: list[str],
     incomplete: dict[str, list[str]],
+    color: bool,
 ) -> list[str]:
     """Render one section as --detailed blocks, mirroring `_section_lines`."""
     header = _section_header(title, key, incomplete)
@@ -551,11 +723,25 @@ def _detailed_section(
     for pr in prs:
         if pr["isDraft"] and not divider_added:
             lines.append("")
-            lines.append(DRAFT_DIVIDER_TEXT)
+            lines.append(_paint(DRAFT_DIVIDER_TEXT, _DIVIDER_SGR, color))
             divider_added = True
         lines.append("")
-        lines.extend(_detail_lines(pr, now, highlight, links, key))
+        lines.extend(_detail_lines(pr, now, highlight, links, key, color))
     return lines
+
+
+def _legend(color: bool) -> str:
+    """Build the legend line, mirroring the reviewer-mark colours."""
+    if not color:
+        return LEGEND
+    parts = [
+        _paint("✔ approved", _MARK_SGR["✔"], True),
+        _paint("✗ changes requested", _MARK_SGR["✗"], True),
+        _paint("● commented", _MARK_SGR["●"], True),
+        "· pending",
+        "* code owner",
+    ]
+    return "  ".join(parts)
 
 
 def build_output(
@@ -566,20 +752,30 @@ def build_output(
     links: bool,
     incomplete: dict[str, list[str]],
     detailed: bool = False,
+    color: bool = False,
+    width: int | None = None,
 ) -> str:
     """Render the Mine and Review sections into one block of text.
 
     `mine` and `review` must already be in display order (see
     `classify`); this function only lays them out, splits off drafts
     at the "── DRAFTS ──" divider, and adds the legend. In table mode
-    (the default) each section is a table; in detailed mode each PR
-    is a multi-line block.
+    (the default) each section is a table fitted to `width` (None
+    keeps the fixed caps); in detailed mode each PR is a multi-line
+    block and `width` is ignored.
     """
     lines = []
     if detailed:
         lines.extend(
             _detailed_section(
-                "MY OPEN PULL REQUESTS", "mine", mine, now, links, highlight, incomplete
+                "MY OPEN PULL REQUESTS",
+                "mine",
+                mine,
+                now,
+                links,
+                highlight,
+                incomplete,
+                color,
             )
         )
         lines.append("")
@@ -592,6 +788,7 @@ def build_output(
                 links,
                 highlight,
                 incomplete,
+                color,
             )
         )
     else:
@@ -606,6 +803,8 @@ def build_output(
                 incomplete,
                 MINE_COLUMNS,
                 _mine_cells,
+                color,
+                width,
             )
         )
         lines.append("")
@@ -620,11 +819,25 @@ def build_output(
                 incomplete,
                 REVIEW_COLUMNS,
                 _review_cells,
+                color,
+                width,
             )
         )
     lines.append("")
-    lines.append(LEGEND)
+    lines.append(_legend(color))
     return "\n".join(lines)
+
+
+def _use_color(tty: bool) -> bool:
+    """Colour gate: a TTY, NO_COLOR unset or empty, and TERM not dumb."""
+    return tty and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def _effective_width(tty: bool) -> int | None:
+    """Terminal width for table fitting, floored at 80. None when piped."""
+    if not tty:
+        return None
+    return max(shutil.get_terminal_size().columns, 80)
 
 
 def _split_csv(value: str) -> list[str]:
@@ -679,14 +892,17 @@ def main(argv: list[str] | None = None) -> int:
     if review_failed:
         incomplete["review"] = review_failed
 
+    tty = sys.stdout.isatty()
     output = build_output(
         mine,
         review,
         now,
         args.highlight_reviewers,
-        sys.stdout.isatty(),
+        tty,
         incomplete,
         args.detailed,
+        color=_use_color(tty),
+        width=_effective_width(tty),
     )
     print(output)
 

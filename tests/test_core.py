@@ -368,6 +368,156 @@ def test_links_false_emits_no_escape_bytes():
     assert "\x1b" not in output
 
 
+# --- colour ----------------------------------------------------------------
+
+
+def test_color_paints_reviewer_entries_by_mark():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    pr = make_pr(
+        number=1,
+        repo="acme/a",
+        reviews=[
+            ("alice", "APPROVED", "2026-08-01T00:00:00Z"),
+            ("bob", "CHANGES_REQUESTED", "2026-08-01T00:00:00Z"),
+            ("carol", "COMMENTED", "2026-08-01T00:00:00Z"),
+        ],
+        requests=[("dave", False)],
+    )
+
+    output = build_output([pr], [], now, [], False, {}, color=True)
+
+    assert "\x1b[32malice✔\x1b[0m" in output
+    assert "\x1b[31mbob✗\x1b[0m" in output
+    assert "\x1b[33mcarol●\x1b[0m" in output
+    # Pending stays plain: the entry follows a reset with no new colour.
+    assert "\x1b[0m dave·" in output
+
+
+def test_color_paints_decision_cell():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    pr = make_pr(number=1, repo="acme/a", decision="APPROVED")
+
+    output = build_output([pr], [], now, [], False, {}, color=True)
+
+    assert "\x1b[32mapproved\x1b[0m" in output
+
+
+def test_color_paints_legend_marks():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+
+    output = build_output([], [], now, [], False, {}, color=True)
+
+    assert "\x1b[32m✔ approved\x1b[0m" in output
+    assert "\x1b[31m✗ changes requested\x1b[0m" in output
+    assert "\x1b[33m● commented\x1b[0m" in output
+    assert "· pending" in output
+
+
+def test_color_paints_highlight_column_mark():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    pr = make_pr(number=1, repo="acme/a", reviews=[("alice", "APPROVED", "2026-08-01T00:00:00Z")])
+
+    output = build_output([pr], [], now, ["alice"], False, {}, color=True)
+
+    row_line = next(line for line in output.splitlines() if "acme/a#1" in line)
+    assert row_line.rstrip().endswith("\x1b[32m✔\x1b[0m")
+
+
+def test_color_dims_draft_rows_and_divider():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    draft = make_pr(
+        number=2,
+        repo="acme/b",
+        draft=True,
+        reviews=[("alice", "APPROVED", "2026-08-01T00:00:00Z")],
+    )
+
+    output = build_output([draft], [], now, [], False, {}, color=True)
+
+    assert "\x1b[90macme/b#2\x1b[0m" in output
+    assert "\x1b[2;32malice✔\x1b[0m" in output
+    assert "\x1b[2;90m── DRAFTS" in output
+
+
+def test_color_false_emits_no_escape_bytes():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    draft = make_pr(number=1, repo="acme/a", draft=True, decision="APPROVED")
+
+    output = build_output([draft], [], now, [], False, {}, color=False)
+
+    assert "\x1b" not in output
+
+
+# --- terminal width ---------------------------------------------------------
+
+
+def test_wide_terminal_lets_title_grow_past_50():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    title = "x" * 60
+    pr = make_pr(number=1, repo="acme/a", title=title)
+
+    output = build_output([pr], [], now, [], False, {}, width=200)
+
+    assert title in output
+
+
+def test_narrow_terminal_floors_title_and_strips_conventional_prefix():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    pr = make_pr(
+        number=1,
+        repo="acme/averyveryverylongreponame",
+        title="feat(api): implement wonderful widget factory thing",
+    )
+
+    output = build_output([pr], [], now, [], False, {}, width=80)
+
+    assert "feat(api)" not in output
+    assert "implement wond…" in output
+
+
+def test_narrow_terminal_reduces_reviewer_cap_keeping_highlighted():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    requests = [(f"reviewer{i}", False) for i in range(7)]
+    pr = make_pr(number=1, repo="acme/a", title="T", requests=requests)
+
+    output = build_output([pr], [], now, ["reviewer6"], False, {}, width=80)
+
+    row_line = next(line for line in output.splitlines() if "acme/a#1" in line)
+    assert "reviewer6·" in row_line
+    assert "reviewer0· reviewer6· +5" in row_line
+
+
+def test_narrow_terminal_drops_author_name_keeps_login():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    pr = make_pr(
+        number=1,
+        repo="acme/a",
+        title="A modest medium title",
+        author=("alice", "Alexandrina Considerable-Longname"),
+    )
+
+    output = build_output([], [pr], now, [], False, {}, width=90)
+
+    assert "Alexandrina" not in output
+    row_line = next(line for line in output.splitlines() if "acme/a#1" in line)
+    assert "alice" in row_line
+    assert "A modest medium title" in output
+
+
+def test_table_divider_stretches_to_table_width():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    pr = make_pr(number=1, repo="acme/a", created="2026-08-01T00:00:00Z")
+    draft = make_pr(number=2, repo="acme/b", draft=True, created="2026-08-02T00:00:00Z")
+
+    output = build_output([pr, draft], [], now, [], False, {})
+
+    lines = output.splitlines()
+    divider_line = next(line for line in lines if line.startswith("── DRAFTS"))
+    header_line = next(line for line in lines if line.startswith("PR "))
+    assert len(divider_line) > len(DRAFT_DIVIDER_TEXT)
+    assert len(divider_line) == len(header_line)
+
+
 # --- detailed view ---------------------------------------------------------
 
 
@@ -512,6 +662,26 @@ def test_detailed_none_and_incomplete_suffix():
 
     assert "MY OPEN PULL REQUESTS  (none)" in output
     assert "WAITING FOR MY REVIEW  (incomplete: requested search failed)" in output
+
+
+def test_detailed_color_paints_ci_and_dims_draft():
+    now = datetime.fromisoformat("2026-08-15T00:00:00Z")
+    pr = make_pr(
+        number=1, repo="acme/a", last_commit="2026-08-01T00:00:00Z", ci_state="SUCCESS"
+    )
+    draft = make_pr(
+        number=2,
+        repo="acme/b",
+        draft=True,
+        reviews=[("alice", "APPROVED", "2026-08-01T00:00:00Z")],
+    )
+
+    output = build_output([pr, draft], [], now, [], False, {}, detailed=True, color=True)
+
+    assert "\x1b[32mSUCCESS\x1b[0m" in output
+    assert "\x1b[90macme/b#2\x1b[0m" in output
+    assert "\x1b[2;32malice✔\x1b[0m" in output
+    assert "\x1b[2;90m── DRAFTS ──\x1b[0m" in output
 
 
 def test_detailed_drafts_divider():
